@@ -7,30 +7,22 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from feature_extractor import extract_features
+from form_analyzer import analyze_form
 
 
 # ============================================================
-# LOAD TRAINED MODEL
+# MODEL
 # ============================================================
 
-MODEL_PATH = "yoga_pose_model.pkl"
-LABEL_MAPPING_PATH = "label_mapping.pkl"
+MODEL_PATH = "yoga_pose_model_v3.pkl"
+LABEL_MAPPING_PATH = "label_mapping_v3.pkl"
+
 
 model = joblib.load(MODEL_PATH)
 
 label_mapping = joblib.load(
     LABEL_MAPPING_PATH
 )
-
-# Convert:
-# plank -> 0
-# tree -> 1
-# warrior_ii -> 2
-#
-# into:
-# 0 -> plank
-# 1 -> tree
-# 2 -> warrior_ii
 
 reverse_mapping = {
     value: key
@@ -39,7 +31,7 @@ reverse_mapping = {
 
 
 # ============================================================
-# MEDIAPIPE SETUP
+# MEDIAPIPE
 # ============================================================
 
 base_options = python.BaseOptions(
@@ -58,56 +50,27 @@ detector = vision.PoseLandmarker.create_from_options(
 
 
 # ============================================================
-# MEDIAPIPE POSE CONNECTIONS
+# POSE CONNECTIONS
 # ============================================================
 
 POSE_CONNECTIONS = [
-    # Face
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 7),
-
-    (0, 4),
-    (4, 5),
-    (5, 6),
-    (6, 8),
-
-    # Left arm
     (11, 13),
     (13, 15),
 
-    # Right arm
     (12, 14),
     (14, 16),
 
-    # Shoulders
     (11, 12),
 
-    # Left side body
     (11, 23),
     (23, 25),
     (25, 27),
 
-    # Right side body
     (12, 24),
     (24, 26),
     (26, 28),
 
-    # Hips
-    (23, 24),
-
-    # Left leg
-    (27, 29),
-    (29, 31),
-
-    # Right leg
-    (28, 30),
-    (30, 32),
-
-    # Feet
-    (27, 31),
-    (28, 32)
+    (23, 24)
 ]
 
 
@@ -120,15 +83,32 @@ cap = cv2.VideoCapture(0)
 if not cap.isOpened():
 
     print("ERROR: Could not open webcam.")
-
     exit()
+
+
+# ============================================================
+# PREDICTION SMOOTHING
+# ============================================================
+
+prediction_history = []
+
+HISTORY_SIZE = 10
 
 
 # ============================================================
 # TIMESTAMP
 # ============================================================
 
-frame_timestamp = 0
+timestamp = 0
+
+
+# ============================================================
+# FORM SCORE SMOOTHING
+# ============================================================
+
+score_history = []
+
+SCORE_HISTORY_SIZE = 8
 
 
 # ============================================================
@@ -142,7 +122,6 @@ while True:
     if not success:
 
         print("Could not read webcam frame.")
-
         break
 
 
@@ -155,29 +134,22 @@ while True:
         1
     )
 
-
-    # Get frame dimensions
-
     height, width, _ = frame.shape
 
 
     # --------------------------------------------------------
-    # Convert BGR → RGB
+    # Convert image
     # --------------------------------------------------------
 
-    frame_rgb = cv2.cvtColor(
+    rgb_frame = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
     )
 
 
-    # --------------------------------------------------------
-    # Create MediaPipe image
-    # --------------------------------------------------------
-
     mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
-        data=frame_rgb
+        data=rgb_frame
     )
 
 
@@ -185,7 +157,7 @@ while True:
     # Timestamp
     # --------------------------------------------------------
 
-    frame_timestamp += 33
+    timestamp += 33
 
 
     # --------------------------------------------------------
@@ -194,12 +166,12 @@ while True:
 
     result = detector.detect_for_video(
         mp_image,
-        frame_timestamp
+        timestamp
     )
 
 
     # ========================================================
-    # IF POSE FOUND
+    # POSE DETECTED
     # ========================================================
 
     if result.pose_landmarks:
@@ -208,7 +180,7 @@ while True:
 
 
         # ====================================================
-        # DRAW LANDMARK DOTS
+        # DRAW LANDMARKS
         # ====================================================
 
         for landmark in landmarks:
@@ -221,9 +193,6 @@ while True:
                 landmark.y * height
             )
 
-
-            # Make sure point is inside frame
-
             if (
                 0 <= x < width
                 and
@@ -233,7 +202,7 @@ while True:
                 cv2.circle(
                     frame,
                     (x, y),
-                    5,
+                    4,
                     (0, 255, 0),
                     -1
                 )
@@ -245,44 +214,29 @@ while True:
 
         for start, end in POSE_CONNECTIONS:
 
-            start_landmark = landmarks[start]
-            end_landmark = landmarks[end]
+            p1 = landmarks[start]
+            p2 = landmarks[end]
 
+            x1 = int(p1.x * width)
+            y1 = int(p1.y * height)
 
-            start_x = int(
-                start_landmark.x * width
-            )
-
-            start_y = int(
-                start_landmark.y * height
-            )
-
-
-            end_x = int(
-                end_landmark.x * width
-            )
-
-            end_y = int(
-                end_landmark.y * height
-            )
-
-
-            # Make sure both points are visible
+            x2 = int(p2.x * width)
+            y2 = int(p2.y * height)
 
             if (
-                0 <= start_x < width
+                0 <= x1 < width
                 and
-                0 <= start_y < height
+                0 <= y1 < height
                 and
-                0 <= end_x < width
+                0 <= x2 < width
                 and
-                0 <= end_y < height
+                0 <= y2 < height
             ):
 
                 cv2.line(
                     frame,
-                    (start_x, start_y),
-                    (end_x, end_y),
+                    (x1, y1),
+                    (x2, y2),
                     (255, 255, 255),
                     2
                 )
@@ -297,12 +251,9 @@ while True:
         )
 
 
-        # ====================================================
-        # PREPARE MODEL INPUT
-        # ====================================================
-
         X = np.array(
-            features
+            features,
+            dtype=float
         ).reshape(
             1,
             -1
@@ -310,40 +261,59 @@ while True:
 
 
         # ====================================================
-        # PREDICT POSE
+        # MODEL PREDICTION
         # ====================================================
 
         prediction = model.predict(X)[0]
 
+        probabilities = model.predict_proba(X)[0]
+
+        confidence = float(
+            np.max(probabilities)
+        )
+
+
+        # ====================================================
+        # STORE PREDICTION
+        # ====================================================
+
+        prediction_history.append(
+            int(prediction)
+        )
+
+
+        if len(prediction_history) > HISTORY_SIZE:
+
+            prediction_history.pop(0)
+
+
+        # ====================================================
+        # MAJORITY VOTE
+        # ====================================================
+
+        counts = np.bincount(
+            prediction_history,
+            minlength=len(label_mapping)
+        )
+
+        stable_prediction = int(
+            np.argmax(counts)
+        )
+
 
         pose_name = reverse_mapping[
-            int(prediction)
+            stable_prediction
         ]
 
 
         # ====================================================
-        # CONFIDENCE
+        # UNKNOWN THRESHOLD
         # ====================================================
 
-        confidence = None
+        if confidence < 0.60:
 
-        if hasattr(
-            model,
-            "predict_proba"
-        ):
+            pose_name = "unknown"
 
-            probabilities = model.predict_proba(
-                X
-            )[0]
-
-            confidence = float(
-                np.max(probabilities)
-            )
-
-
-        # ====================================================
-        # DISPLAY POSE
-        # ====================================================
 
         display_name = pose_name.replace(
             "_",
@@ -351,36 +321,132 @@ while True:
         ).upper()
 
 
+        # ====================================================
+        # POSE DISPLAY
+        # ====================================================
+
         cv2.putText(
             frame,
-            f"Pose: {display_name}",
-            (30, 50),
+            f"POSE: {display_name}",
+            (25, 45),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.85,
             (0, 255, 0),
             2
         )
 
 
         # ====================================================
-        # DISPLAY CONFIDENCE
+        # CONFIDENCE
         # ====================================================
 
-        if confidence is not None:
+        cv2.putText(
+            frame,
+            f"CONFIDENCE: {confidence * 100:.1f}%",
+            (25, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2
+        )
 
-            confidence_text = (
-                f"Confidence: "
-                f"{confidence * 100:.1f}%"
+
+        # ====================================================
+        # FORM ANALYSIS
+        # ====================================================
+
+        if pose_name in [
+            "plank",
+            "tree",
+            "warrior_ii"
+        ]:
+
+            form_result = analyze_form(
+                pose_name,
+                landmarks
             )
+
+            current_score = form_result[
+                "score"
+            ]
+
+            feedback = form_result[
+                "feedback"
+            ]
+
+
+            # =================================================
+            # SCORE SMOOTHING
+            # =================================================
+
+            score_history.append(
+                current_score
+            )
+
+
+            if len(score_history) > SCORE_HISTORY_SIZE:
+
+                score_history.pop(0)
+
+
+            form_score = int(
+                round(
+                    sum(score_history)
+                    /
+                    len(score_history)
+                )
+            )
+
+
+            # =================================================
+            # FORM SCORE
+            # =================================================
+
+            cv2.putText(
+                frame,
+                f"FORM SCORE: {form_score}/100",
+                (25, 125),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 255, 255),
+                2
+            )
+
+
+            # =================================================
+            # FEEDBACK
+            # =================================================
+
+            y_position = 165
+
+
+            for message in feedback[:2]:
+
+                cv2.putText(
+                    frame,
+                    message,
+                    (25, y_position),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                y_position += 30
+
+
+        else:
+
+            score_history.clear()
 
 
             cv2.putText(
                 frame,
-                confidence_text,
-                (30, 90),
+                "FORM: No yoga pose",
+                (25, 125),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
+                0.65,
+                (255, 255, 255),
                 2
             )
 
@@ -391,19 +457,39 @@ while True:
 
     else:
 
+        prediction_history.clear()
+
+        score_history.clear()
+
+
         cv2.putText(
             frame,
-            "No pose detected",
-            (30, 50),
+            "NO POSE DETECTED",
+            (25, 50),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.85,
             (0, 0, 255),
             2
         )
 
 
     # ========================================================
-    # DISPLAY
+    # INSTRUCTIONS
+    # ========================================================
+
+    cv2.putText(
+        frame,
+        "Press Q to quit",
+        (25, height - 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2
+    )
+
+
+    # ========================================================
+    # SHOW
     # ========================================================
 
     cv2.imshow(
@@ -413,7 +499,7 @@ while True:
 
 
     # ========================================================
-    # PRESS Q TO EXIT
+    # QUIT
     # ========================================================
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
